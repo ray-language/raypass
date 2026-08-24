@@ -1,0 +1,192 @@
+// raypass — the vault: one encrypted file, whole-file AEAD.
+//
+// On disk: {"salt": hex, "nonce": hex, "box": base64} where box =
+// ChaCha20-Poly1305(key = HKDF(salt, passphrase, "raypass-v1"), nonce,
+// aad = "raypass", plaintext = JSON {name: {value, updated_ms}}). Every save
+// draws a fresh nonce and goes through temp + rename (atomic). A wrong
+// passphrase fails AEAD authentication — there is no oracle beyond open().
+//
+// Honest limits (recorded findings): secrets pass through GC-managed strings
+// with no way to zeroize them, and the vault file cannot be chmod 600 — fs
+// exposes no permissions API.
+import std/fs;
+import std/time;
+import std/crypto;
+import std/hex;
+import std/base64;
+import std/json;
+from std/json import Json;
+
+pub struct Entry {
+    name: string,
+    value: string,
+    updated_ms: int,
+}
+
+pub struct Vault {
+    entries: [Entry],
+}
+
+fn derive_key(passphrase: string, salt: bytes) -> bytes {
+    match (crypto.hkdf_sha256(salt, passphrase.to_bytes(), "raypass-v1".to_bytes(), 32)) {
+        Option.Some(k) => k,
+        Option.None => b"",
+    }
+}
+
+fn entries_to_json(v: Vault) -> string {
+    var m: Map<string, Json> = Map.new();
+    for e in v.entries {
+        var em: Map<string, Json> = Map.new();
+        em.insert("value", Json.JStr(e.value));
+        em.insert("updated_ms", Json.JNum(e.updated_ms as float));
+        m.insert(e.name, Json.JObject(em));
+    }
+    json.stringify(Json.JObject(m))
+}
+
+fn entries_from_json(s: string) -> Result<Vault, string> {
+    let j = json.parse(s)?;
+    var out: [Entry] = [];
+    match (json.as_object(j)) {
+        Option.Some(m) => {
+            for name in m.keys() {
+                match (get(m, name)) {
+                    Option.Some(em) => {
+                        let value = match (json.get_string(em, "value")) {
+                            Option.Some(v) => v,
+                            Option.None => "",
+                        };
+                        let updated = match (json.get_int(em, "updated_ms")) {
+                            Option.Some(n) => n,
+                            Option.None => 0,
+                        };
+                        out.push(Entry { name: name, value: value, updated_ms: updated });
+                    },
+                    Option.None => { },
+                }
+            }
+        },
+        Option.None => {
+            return Result.Err("vault payload is not an object");
+        },
+    }
+    Result.Ok(Vault { entries: out })
+}
+
+pub fn save(path: string, passphrase: string, v: Vault) -> Result<int, string> {
+    let salt = crypto.random_bytes(16);
+    let nonce = crypto.random_bytes(12);
+    let key = derive_key(passphrase, salt);
+    let sealed = match (crypto.chacha20poly1305_seal(
+        key,
+        nonce,
+        "raypass".to_bytes(),
+        entries_to_json(v).to_bytes()
+    )) {
+        Option.Some(b) => b,
+        Option.None => {
+            return Result.Err("seal failed");
+        },
+    };
+    var m: Map<string, Json> = Map.new();
+    m.insert("salt", Json.JStr(hex.hex_encode(salt)));
+    m.insert("nonce", Json.JStr(hex.hex_encode(nonce)));
+    m.insert("box", Json.JStr(base64.base64(sealed)));
+    let tmp = path + ".tmp";
+    fs.write_file(tmp, json.stringify(Json.JObject(m)))?;
+    fs.rename(tmp, path)
+}
+
+fn hex_field(j: Json, k: string) -> Result<bytes, string> {
+    match (json.get_string(j, k)) {
+        Option.Some(s) => {
+            match (hex.hex_decode(s)) {
+                Result.Ok(b) => Result.Ok(b),
+                Result.Err(e) => Result.Err("bad " + k),
+            }
+        },
+        Option.None => Result.Err("missing " + k),
+    }
+}
+
+pub fn load(path: string, passphrase: string) -> Result<Vault, string> {
+    let src = fs.read_file(path)?;
+    let j = json.parse(src)?;
+    let salt = hex_field(j, "salt")?;
+    let nonce = hex_field(j, "nonce")?;
+    let boxed = match (json.get_string(j, "box")) {
+        Option.Some(s) => {
+            match (base64.base64_decode(s)) {
+                Result.Ok(b) => b,
+                Result.Err(e) => {
+                    return Result.Err("bad box");
+                },
+            }
+        },
+        Option.None => {
+            return Result.Err("missing box");
+        },
+    };
+    let key = derive_key(passphrase, salt);
+    match (crypto.chacha20poly1305_open(key, nonce, "raypass".to_bytes(), boxed)) {
+        Option.Some(plain) => {
+            let s = from_utf8(plain)?;
+            entries_from_json(s)
+        },
+        Option.None => Result.Err("wrong passphrase (or corrupted vault)"),
+    }
+}
+
+pub fn empty() -> Vault {
+    var entries: [Entry] = [];
+    Vault { entries: entries }
+}
+
+pub fn find(v: Vault, name: string) -> Option<string> {
+    for e in v.entries {
+        if (e.name == name) {
+            return Option.Some(e.value);
+        }
+    }
+    Option.None
+}
+
+pub fn upsert(v: Vault, name: string, value: string) {
+    var kept: [Entry] = [];
+    for e in v.entries {
+        if (e.name != name) {
+            kept.push(e);
+        }
+    }
+    kept.push(Entry { name: name, value: value, updated_ms: time.now() });
+    v.entries = kept;
+}
+
+pub fn remove_entry(v: Vault, name: string) -> bool {
+    var kept: [Entry] = [];
+    var found = false;
+    for e in v.entries {
+        if (e.name == name) {
+            found = true;
+        } else {
+            kept.push(e);
+        }
+    }
+    v.entries = kept;
+    found
+}
+
+// A generated password: letters, digits and safe punctuation, CSPRNG-backed.
+pub fn generate(len: int) -> string {
+    let alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:+*";
+    let raw = crypto.random_bytes(len);
+    var out = "";
+    var i = 0;
+    while (i < len) {
+        let idx = raw[i] % alphabet.len();
+        out = out + alphabet.substring(idx, idx + 1);
+        i = i + 1;
+    }
+    out
+}

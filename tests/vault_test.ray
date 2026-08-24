@@ -1,0 +1,84 @@
+// Vault round trips, wrong passphrase, generation, and the sealed-box share.
+import std/fs;
+import vault;
+import sharebox;
+
+const PATH: string = "/tmp/raypass_test.vault";
+
+@test
+fn vault_round_trip_and_wrong_passphrase() {
+    fs.remove_file(PATH);
+    var v = vault.empty();
+    vault.upsert(v, "db-password", "s3cr3t!");
+    vault.upsert(v, "api-key", "ak-123");
+    vault.upsert(v, "db-password", "nuevo");
+    match (vault.save(PATH, "correcta", v)) {
+        Result.Ok(n) => { },
+        Result.Err(e) => panic(e),
+    }
+    assert(!fs.exists(PATH + ".tmp"));
+    let loaded = match (vault.load(PATH, "correcta")) {
+        Result.Ok(x) => x,
+        Result.Err(e) => panic(e),
+    };
+    assert_eq(loaded.entries.len(), 2);
+    match (vault.find(loaded, "db-password")) {
+        Option.Some(val) => assert_eq(val, "nuevo"),
+        Option.None => panic("missing db-password"),
+    }
+    match (vault.load(PATH, "incorrecta")) {
+        Result.Err(e) => assert(e.contains("passphrase")),
+        Result.Ok(x) => panic("wrong passphrase must fail"),
+    }
+    // The ciphertext never contains the secret in clear.
+    match (fs.read_file(PATH)) {
+        Result.Ok(raw) => {
+            assert(!raw.contains("s3cr3t"));
+            assert(!raw.contains("nuevo"));
+            assert(!raw.contains("ak-123"));
+        },
+        Result.Err(e) => panic(e),
+    }
+}
+
+@test
+fn remove_and_generate() {
+    fs.remove_file(PATH);
+    var v = vault.empty();
+    vault.upsert(v, "a", "1");
+    assert(vault.remove_entry(v, "a"));
+    assert(!vault.remove_entry(v, "a"));
+    assert_eq(v.entries.len(), 0);
+    let p1 = vault.generate(24);
+    let p2 = vault.generate(24);
+    assert_eq(p1.len(), 24);
+    assert(p1 != p2);
+    assert_eq(vault.generate(8).len(), 8);
+}
+
+@test
+fn share_round_trip_and_tamper_detection() {
+    let (sec, pub_key) = sharebox.keygen();
+    assert(sec != "");
+    assert(pub_key != "");
+    let blob = match (sharebox.seal_to(pub_key, "el secreto compartido ñ")) {
+        Result.Ok(b) => b,
+        Result.Err(e) => panic(e),
+    };
+    match (sharebox.open_from(sec, blob)) {
+        Result.Ok(plain) => assert_eq(plain, "el secreto compartido ñ"),
+        Result.Err(e) => panic(e),
+    }
+    // A different key cannot open it.
+    let (sec2, pub2) = sharebox.keygen();
+    match (sharebox.open_from(sec2, blob)) {
+        Result.Err(e) => assert(e.contains("decrypt")),
+        Result.Ok(p) => panic("foreign key must fail"),
+    }
+    // Tampering breaks authentication.
+    let tampered = blob.substring(0, blob.len() - 2) + "AA";
+    match (sharebox.open_from(sec, tampered)) {
+        Result.Err(e) => { },
+        Result.Ok(p) => panic("tampered blob must fail"),
+    }
+}

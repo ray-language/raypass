@@ -1,0 +1,92 @@
+// raypass — sharing a secret with a person, not a machine: X25519 sealed box.
+//
+// seal_to: ephemeral X25519 pair; key = HKDF(eph_pub, DH(eph_sec, recipient
+// pub), "raypass-share"); blob = eph_pub(32) ‖ nonce(12) ‖ AEAD box. The
+// recipient recomputes the same DH with their secret. Raw DH output always
+// goes through HKDF before use as an AEAD key (the M114 rule).
+import std/crypto;
+import std/base64;
+
+pub fn keygen() -> (string, string) {
+    let sec = crypto.random_bytes(32);
+    match (crypto.x25519_public_key(sec)) {
+        Option.Some(pub_key) => {
+            return (base64.base64url(sec), base64.base64url(pub_key));
+        },
+        Option.None => { },
+    }
+    return ("", "");
+}
+
+fn derive(eph_pub: bytes, shared: bytes) -> bytes {
+    match (crypto.hkdf_sha256(eph_pub, shared, "raypass-share".to_bytes(), 32)) {
+        Option.Some(k) => k,
+        Option.None => b"",
+    }
+}
+
+pub fn seal_to(recipient_pub_b64: string, plaintext: string) -> Result<string, string> {
+    let recipient = match (base64.base64url_decode(recipient_pub_b64)) {
+        Result.Ok(b) => b,
+        Result.Err(e) => {
+            return Result.Err("bad recipient key");
+        },
+    };
+    let eph_sec = crypto.random_bytes(32);
+    let eph_pub = match (crypto.x25519_public_key(eph_sec)) {
+        Option.Some(p) => p,
+        Option.None => {
+            return Result.Err("keygen failed");
+        },
+    };
+    let shared = match (crypto.x25519_shared_secret(eph_sec, recipient)) {
+        Option.Some(s) => s,
+        Option.None => {
+            return Result.Err("invalid recipient key");
+        },
+    };
+    let nonce = crypto.random_bytes(12);
+    let sealed = match (crypto.chacha20poly1305_seal(
+        derive(eph_pub, shared),
+        nonce,
+        b"",
+        plaintext.to_bytes()
+    )) {
+        Option.Some(b) => b,
+        Option.None => {
+            return Result.Err("seal failed");
+        },
+    };
+    Result.Ok(base64.base64url(eph_pub + nonce + sealed))
+}
+
+pub fn open_from(my_sec_b64: string, blob_b64: string) -> Result<string, string> {
+    let sec = match (base64.base64url_decode(my_sec_b64)) {
+        Result.Ok(b) => b,
+        Result.Err(e) => {
+            return Result.Err("bad secret key");
+        },
+    };
+    let blob = match (base64.base64url_decode(blob_b64.trim())) {
+        Result.Ok(b) => b,
+        Result.Err(e) => {
+            return Result.Err("bad blob");
+        },
+    };
+    if (blob.len() < 32 + 12 + 16) {
+        return Result.Err("blob too short");
+    }
+    let eph_pub = blob.sub_bytes(0, 32);
+    let nonce = blob.sub_bytes(32, 44);
+    let sealed = blob.sub_bytes(44, blob.len());
+    let shared = match (crypto.x25519_shared_secret(sec, eph_pub)) {
+        Option.Some(s) => s,
+        Option.None => {
+            return Result.Err("invalid keys");
+        },
+    };
+    match (crypto.chacha20poly1305_open(derive(eph_pub, shared), nonce, b"", sealed)) {
+        Option.Some(plain) => from_utf8(plain),
+        Option.None => Result.Err("cannot decrypt (wrong key or tampered blob)"),
+    }
+}

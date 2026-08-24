@@ -1,0 +1,353 @@
+// raypass — an encrypted secrets vault for the command line.
+import std/fs;
+import std/io;
+import std/process;
+import vault;
+import sharebox;
+import input;
+
+fn usage() {
+    eprint("usage: raypass [--vault FILE] COMMAND");
+    eprint("");
+    eprint("  init                     create an empty vault");
+    eprint("  add NAME [VALUE]         store a secret (prompts hidden without VALUE)");
+    eprint("  get NAME                 print a secret");
+    eprint("  list                     list entry names");
+    eprint("  rm NAME                  delete an entry");
+    eprint("  gen NAME [--len N]       generate, store and print a password (default 24)");
+    eprint("  exec -- CMD [ARGS...]    run CMD with every entry injected as env var");
+    eprint("  keygen                   X25519 pair for sharing (prints secret + public)");
+    eprint("  share NAME --to PUBKEY   seal a secret to someone's public key");
+    eprint("  receive --key SECKEY     decrypt a shared blob from stdin");
+    eprint("");
+    eprint("  vault: $HOME/.raypass.vault by default; passphrase asked hidden");
+    eprint("  (or RAYPASS_PASSPHRASE for scripts)");
+}
+
+fn flag_value(av: [string], name: string) -> Option<string> {
+    var i = 0;
+    while (i + 1 < av.len()) {
+        if (av[i] == name) {
+            return Option.Some(av[i + 1]);
+        }
+        i = i + 1;
+    }
+    Option.None
+}
+
+fn vault_path(av: [string]) -> string {
+    match (flag_value(av, "--vault")) {
+        Option.Some(p) => p,
+        Option.None => {
+            match (env("HOME")) {
+                Option.Some(h) => h + "/.raypass.vault",
+                Option.None => "./.raypass.vault",
+            }
+        },
+    }
+}
+
+// Positional args (flags and their values skipped), so the command may go
+// before or after --vault: the FIRST positional is the command.
+fn positionals(av: [string]) -> [string] {
+    var out: [string] = [];
+    var i = 0;
+    var skip = false;
+    while (i < av.len()) {
+        let a = av[i];
+        if (a == "--") {
+            return out;
+        }
+        if (skip) {
+            skip = false;
+        } else if (a.starts_with("--")) {
+            skip = true;
+        } else {
+            out.push(a);
+        }
+        i = i + 1;
+    }
+    out
+}
+
+fn after_dashdash(av: [string]) -> [string] {
+    var out: [string] = [];
+    var seen = false;
+    for a in av {
+        if (seen) {
+            out.push(a);
+        } else if (a == "--") {
+            seen = true;
+        }
+    }
+    out
+}
+
+fn passphrase() -> Result<string, string> {
+    input.hidden_line("passphrase: ")
+}
+
+fn open_vault(path: string) -> Result<(string, vault.Vault), string> {
+    let pw = passphrase()?;
+    let v = vault.load(path, pw)?;
+    return Result.Ok((pw, v));
+}
+
+fn main() -> int {
+    let av = args();
+    if (av.len() < 1 || av[0] == "--help" || av[0] == "-h" || av[0] == "help") {
+        usage();
+        return if (av.len() < 1) { 1 } else { 0 };
+    }
+    let all_pos = positionals(av);
+    if (all_pos.len() == 0) {
+        usage();
+        return 1;
+    }
+    let cmd = all_pos[0];
+    let path = vault_path(av);
+    var pos: [string] = [];
+    var pi = 1;
+    while (pi < all_pos.len()) {
+        pos.push(all_pos[pi]);
+        pi = pi + 1;
+    }
+    if (cmd == "init") {
+        if (fs.exists(path)) {
+            eprint("raypass: " + path + " already exists");
+            return 1;
+        }
+        let pw = match (passphrase()) {
+            Result.Ok(p) => p,
+            Result.Err(e) => {
+                eprint("raypass: " + e);
+                return 1;
+            },
+        };
+        if (pw.len() < 6) {
+            eprint("raypass: passphrase too short (6+ chars)");
+            return 1;
+        }
+        match (vault.save(
+    path,
+    pw,
+    vault.empty()
+)) {
+            Result.Ok(n) => {
+                print("vault created: " + path);
+                eprint(
+                    "note: the vault file has DEFAULT permissions — fs has no chmod (recorded finding)"
+                );
+                0
+            },
+            Result.Err(e) => {
+                eprint("raypass: " + e);
+                1
+            },
+        }
+    } else if (cmd == "keygen") {
+        let (sec, pub_key) = sharebox.keygen();
+        print("secret:  " + sec);
+        print("public:  " + pub_key);
+        eprint(
+            "guarda el secret (p. ej. `raypass add raypass-key " + sec + "`); comparte el public"
+        );
+        0
+    } else if (cmd == "receive") {
+        let sec = match (flag_value(av, "--key")) {
+            Option.Some(s) => s,
+            Option.None => {
+                eprint("raypass: --key SECKEY is required");
+                return 1;
+            },
+        };
+        var blob = "";
+        var reading = true;
+        while (reading) {
+            match (io.read(4096)) {
+                Option.Some(chunk) => {
+                    match (from_utf8(chunk)) {
+                        Result.Ok(s) => {
+                            blob = blob + s;
+                        },
+                        Result.Err(e) => { },
+                    }
+                },
+                Option.None => {
+                    reading = false;
+                },
+            }
+        }
+        match (sharebox.open_from(sec, blob.trim())) {
+            Result.Ok(plain) => {
+                print(plain);
+                0
+            },
+            Result.Err(e) => {
+                eprint("raypass: " + e);
+                1
+            },
+        }
+    } else {
+        // Everything below needs the vault open.
+        let (pw, v) = match (open_vault(path)) {
+            Result.Ok(pair) => pair,
+            Result.Err(e) => {
+                eprint("raypass: " + e);
+                return 1;
+            },
+        };
+        if (cmd == "add") {
+            if (pos.len() < 1) {
+                usage();
+                return 1;
+            }
+            let value = if (pos.len() >= 2) { pos[1] } else {
+                match (input.hidden_line("value for '" + pos[0] + "': ")) {
+                    Result.Ok(s) => s,
+                    Result.Err(e) => {
+                        eprint("raypass: " + e);
+                        return 1;
+                    },
+                }
+            };
+            vault.upsert(v, pos[0], value);
+            match (vault.save(path, pw, v)) {
+                Result.Ok(n) => 0,
+                Result.Err(e) => {
+                    eprint("raypass: " + e);
+                    1
+                },
+            }
+        } else if (cmd == "get") {
+            if (pos.len() < 1) {
+                usage();
+                return 1;
+            }
+            match (vault.find(v, pos[0])) {
+                Option.Some(value) => {
+                    print(value);
+                    0
+                },
+                Option.None => {
+                    eprint("raypass: no entry '" + pos[0] + "'");
+                    1
+                },
+            }
+        } else if (cmd == "list") {
+            for e in v.entries {
+                print(e.name);
+            }
+            0
+        } else if (cmd == "rm") {
+            if (pos.len() < 1) {
+                usage();
+                return 1;
+            }
+            if (!vault.remove_entry(v, pos[0])) {
+                eprint("raypass: no entry '" + pos[0] + "'");
+                return 1;
+            }
+            match (vault.save(path, pw, v)) {
+                Result.Ok(n) => 0,
+                Result.Err(e) => {
+                    eprint("raypass: " + e);
+                    1
+                },
+            }
+        } else if (cmd == "gen") {
+            if (pos.len() < 1) {
+                usage();
+                return 1;
+            }
+            var len = 24;
+            match (flag_value(av, "--len")) {
+                Option.Some(s) => {
+                    match (parse_int(s)) {
+                        Option.Some(n) => {
+                            len = n;
+                        },
+                        Option.None => { },
+                    }
+                },
+                Option.None => { },
+            }
+            let value = vault.generate(len);
+            vault.upsert(v, pos[0], value);
+            match (vault.save(path, pw, v)) {
+                Result.Ok(n) => {
+                    print(value);
+                    0
+                },
+                Result.Err(e) => {
+                    eprint("raypass: " + e);
+                    1
+                },
+            }
+        } else if (cmd == "share") {
+            if (pos.len() < 1) {
+                usage();
+                return 1;
+            }
+            let to = match (flag_value(av, "--to")) {
+                Option.Some(s) => s,
+                Option.None => {
+                    eprint("raypass: --to PUBKEY is required");
+                    return 1;
+                },
+            };
+            match (vault.find(v, pos[0])) {
+                Option.None => {
+                    eprint("raypass: no entry '" + pos[0] + "'");
+                    1
+                },
+                Option.Some(value) => {
+                    match (sharebox.seal_to(to, value)) {
+                        Result.Ok(blob) => {
+                            print(blob);
+                            0
+                        },
+                        Result.Err(e) => {
+                            eprint("raypass: " + e);
+                            1
+                        },
+                    }
+                },
+            }
+        } else if (cmd == "exec") {
+            let argv = after_dashdash(av);
+            if (argv.len() == 0) {
+                eprint("raypass: exec needs a command after --");
+                return 1;
+            }
+            var rest: [string] = [];
+            var i = 1;
+            while (i < argv.len()) {
+                rest.push(argv[i]);
+                i = i + 1;
+            }
+            var c = process.cmd(argv[0], rest);
+            for e in v.entries {
+                c = c.env(e.name, e.value);
+            }
+            match (c.merge_output().run()) {
+                Result.Err(e) => {
+                    eprint("raypass: could not launch: " + e);
+                    1
+                },
+                Result.Ok(out) => {
+                    io.write_bytes(out.stdout);
+                    io.flush();
+                    match (out.exit) {
+                        process.Exit.Code(code) => code,
+                        process.Exit.Signal(sig) => 1,
+                    }
+                },
+            }
+        } else {
+            eprint("raypass: unknown command: " + cmd);
+            usage();
+            1
+        }
+    }
+}
