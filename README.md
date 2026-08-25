@@ -1,6 +1,6 @@
 # raypass
 
-Gestor de secretos para la línea de comandos, escrito en [raylang](https://github.com/roberto-ayala/raylang): una bóveda de un solo archivo cifrada entera con ChaCha20-Poly1305 (clave por passphrase vía HKDF, escritura atómica por rename), entrada de passphrase **oculta** (raw mode sin eco), generador de contraseñas CSPRNG, `exec` que inyecta los secretos como variables de entorno del hijo, y **compartir un secreto con una persona** vía sealed box X25519.
+Gestor de secretos para la línea de comandos, escrito en [raylang](https://github.com/ray-language/raylang): una bóveda de un solo archivo cifrada entera con ChaCha20-Poly1305 (clave por passphrase vía HKDF, escritura atómica por rename), entrada de passphrase **oculta** (raw mode sin eco), generador de contraseñas CSPRNG, `exec` que inyecta los secretos como variables de entorno del hijo, y **compartir un secreto con una persona** vía sealed box X25519.
 
 ```text
 $ raypass init
