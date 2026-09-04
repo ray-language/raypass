@@ -6,10 +6,15 @@
 // draws a fresh nonce and goes through temp + rename (atomic). A wrong
 // passphrase fails AEAD authentication — there is no oracle beyond open().
 //
-// Honest limits (recorded findings): secrets pass through GC-managed strings
+// Durability and concurrency (raylang M115): the temp file is fsync'ed
+// before the rename (survives a power cut, not only a crash), the vault is
+// chmod 0o600 after every save and load() warns when it finds it more
+// permissive, and a sibling LOCK file (flock) serializes the read-modify-
+// write of concurrent raypass processes.
+//
+// Honest limit (recorded finding): secrets pass through GC-managed strings
 // with no way to zeroize them (a conscious raylang design decision, recorded
-// in its SECURITY.md). The vault file IS chmod 0o600 since raylang M115.3
-// gave fs a permissions API — save() restricts it after every rename.
+// in its SECURITY.md).
 import std/fs;
 import std/time;
 import std/crypto;
@@ -95,10 +100,70 @@ pub fn save(path: string, passphrase: string, v: Vault) -> Result<int, string> {
     m.insert("nonce", Json.JStr(hex.hex_encode(nonce)));
     m.insert("box", Json.JStr(base64.base64(sealed)));
     let tmp = path + ".tmp";
-    fs.write_file(tmp, json.stringify(Json.JObject(m)))?;
+    let h = fs.open(tmp, "w")?;
+    let written = fs.write(h, json.stringify(Json.JObject(m)));
+    // fsync BEFORE the rename: otherwise a power cut can leave an empty vault.
+    let synced = fs.sync(h);
+    close(h);
+    written?;
+    synced?;
     fs.rename(tmp, path)?;
     // A vault is a secret: owner-only (M115.3; rename resets to the umask).
     fs.chmod(path, 0o600)
+}
+
+// The 12 permission bits as the usual octal text ("644").
+fn octal(mode: int) -> string {
+    var out = "";
+    var m = mode;
+    while (m > 0 || out.len() < 3) {
+        out = to_string(m % 8) + out;
+        m = m / 8;
+    }
+    out
+}
+
+// A warning when the vault is readable by group/others (like ssh does with
+// private keys); None when the mode is 0o600 or stricter.
+pub fn permission_warning(path: string) -> Option<string> {
+    match (fs.stat(
+    path
+)) {
+        Result.Ok(st) => {
+            if ((st.mode & 0o77) != 0) {
+                Option.Some(
+                    "vault " + path + " is readable by others (mode " + octal(st.mode) + "); fixing it to 0600 on next save"
+                )
+            } else {
+                Option.None
+            }
+        },
+        Result.Err(e) => Option.None,
+    }
+}
+
+// Exclusive advisory lock on a sibling LOCK file (the vault itself changes
+// inode on every rename, so it cannot carry the lock). Release with unlock().
+pub fn lock(path: string) -> Result<int, string> {
+    let h = fs.open(path + ".lock", "a")?;
+    match (fs.try_lock(h)) {
+        Result.Ok(acquired) => {
+            if (acquired) {
+                Result.Ok(h)
+            } else {
+                close(h);
+                Result.Err("vault is in use by another raypass process")
+            }
+        },
+        Result.Err(e) => {
+            close(h);
+            Result.Err(e)
+        },
+    }
+}
+
+pub fn unlock(h: int) {
+    close(h);
 }
 
 fn hex_field(j: Json, k: string) -> Result<bytes, string> {
@@ -180,16 +245,29 @@ pub fn remove_entry(v: Vault, name: string) -> bool {
     found
 }
 
+pub const ALPHABET: string = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:+*";
+
 // A generated password: letters, digits and safe punctuation, CSPRNG-backed.
+// Rejection sampling: a byte is only used when it falls below the largest
+// multiple of the alphabet size, so every symbol is equally likely (plain
+// `byte % 68` would favor the first 52 symbols).
 pub fn generate(len: int) -> string {
-    let alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:+*";
-    let raw = crypto.random_bytes(len);
+    let n = ALPHABET.len();
+    let limit = 256 - 256 % n;
     var out = "";
-    var i = 0;
-    while (i < len) {
-        let idx = raw[i] % alphabet.len();
-        out = out + alphabet.substring(idx, idx + 1);
-        i = i + 1;
+    var count = 0;
+    while (count < len) {
+        let raw = crypto.random_bytes(len - count + 8);
+        var i = 0;
+        while (i < raw.len() && count < len) {
+            let b = raw[i];
+            if (b < limit) {
+                let idx = b % n;
+                out = out + ALPHABET.substring(idx, idx + 1);
+                count = count + 1;
+            }
+            i = i + 1;
+        }
     }
     out
 }

@@ -82,3 +82,60 @@ fn share_round_trip_and_tamper_detection() {
         Result.Ok(p) => panic("tampered blob must fail"),
     }
 }
+
+@test
+fn generated_passwords_stay_in_the_alphabet() {
+    let p = vault.generate(2000);
+    assert_eq(p.len(), 2000);
+    for c in p.chars() {
+        assert(vault.ALPHABET.contains(to_string(c)));
+    }
+    assert_eq(vault.generate(0), "");
+}
+
+@test
+fn saved_vault_is_owner_only_and_warns_when_loosened() {
+    fs.remove_file(PATH);
+    match (vault.save(PATH, "pw", vault.empty())) {
+        Result.Ok(n) => { },
+        Result.Err(e) => panic(e),
+    }
+    match (fs.stat(PATH)) {
+        Result.Ok(st) => assert_eq(st.mode, 0o600),
+        Result.Err(e) => panic(e),
+    }
+    match (vault.permission_warning(PATH)) {
+        Option.None => { },
+        Option.Some(w) => panic("unexpected warning: " + w),
+    }
+    match (fs.chmod(PATH, 0o644)) {
+        Result.Ok(n) => { },
+        Result.Err(e) => panic(e),
+    }
+    match (vault.permission_warning(PATH)) {
+        Option.Some(w) => assert(w.contains("readable by others")),
+        Option.None => panic("a 0644 vault must warn"),
+    }
+    // A missing vault does not warn (init creates it).
+    match (vault.permission_warning(PATH + ".missing")) {
+        Option.None => { },
+        Option.Some(w) => panic("missing vault must not warn"),
+    }
+}
+
+@test
+fn lock_is_exclusive_until_released() {
+    let first = match (vault.lock(PATH)) {
+        Result.Ok(h) => h,
+        Result.Err(e) => panic(e),
+    };
+    match (vault.lock(PATH)) {
+        Result.Err(e) => assert(e.contains("in use")),
+        Result.Ok(h) => panic("second lock must fail while the first is held"),
+    }
+    vault.unlock(first);
+    match (vault.lock(PATH)) {
+        Result.Ok(h) => vault.unlock(h),
+        Result.Err(e) => panic("lock must be free after unlock: " + e),
+    }
+}

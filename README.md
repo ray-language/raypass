@@ -34,8 +34,15 @@ postgres://…
 - **Compartir**: par efímero X25519; clave = HKDF(eph_pub, DH, "raypass-share");
   blob = eph_pub ‖ nonce ‖ box (la regla M114: el DH crudo SIEMPRE pasa por
   HKDF antes de ser clave AEAD). Manipular el blob rompe la autenticación.
-- **Entrada oculta**: `term.raw` + lectura byte a byte sin eco, con backspace
-  y Ctrl-C; los bytes se decodifican al final (UTF-8 multibyte sobrevive).
+- **Entrada oculta**: `term.read_hidden` (M125): prompt a stderr, backspace
+  por carácter UTF-8, Ctrl-C = error.
+- **Disco** (M115): el temporal se `fsync`ea antes del rename (sobrevive a un
+  corte de luz, no solo a un crash), la bóveda queda `chmod 0600` tras cada
+  guardado y se avisa al abrirla si alguien la aflojó, y un `.lock` hermano
+  (flock) serializa dos `raypass` concurrentes (el segundo falla, no pisa).
+- **exec**: la salida del hijo se retransmite en streaming (`process.stream`),
+  no al final; el código de salida del hijo es el de raypass.
+- **gen**: muestreo por rechazo sobre el alfabeto (sin el sesgo de `byte % n`).
 
 ## Estado actual
 
@@ -46,8 +53,9 @@ postgres://…
 | keygen/share/receive (sealed box X25519, tamper-proof) | ✅ |
 | Escritura atómica de la bóveda; el cifrado nunca filtra valores (test) | ✅ |
 | Binario nativo | ✅ |
-| Tests (bóveda, passphrase errónea, share roundtrip + tamper) | ✅ 3 |
-| chmod 600 de la bóveda | ❌ bloqueado (fs sin API de permisos) |
+| Tests (bóveda, passphrase errónea, share, alfabeto, permisos, lock) | ✅ 6 |
+| chmod 600 de la bóveda + aviso si está más abierta | ✅ (M115.3) |
+| fsync antes del rename; lock entre procesos | ✅ (M115.1/.2) |
 | Zeroización de secretos en memoria | ❌ inexpresable (strings GC) |
 | Portapapeles con auto-borrado, TOTP | 📋 v2 |
 
@@ -55,18 +63,22 @@ postgres://…
 
 Anotados en `raylang/IDEAS.md` §71:
 
-1. **La entrada oculta es artesanía sobre raw** (predicho): ~30 líneas que
-   toda herramienta de secretos repetirá — candidata directa a
-   `term.read_hidden(prompt)`.
-2. **Sin chmod**: la bóveda queda con permisos por defecto y no hay forma de
-   restringirla (`fs.stat`/`fs.chmod` no existen — la otra cara del hallazgo
-   de metadatos de raysync §69).
+1. ✅ **La entrada oculta era artesanía sobre raw** (predicho): ~30 líneas que
+   toda herramienta de secretos repetía — ejecutado como `term.read_hidden`
+   (M125), adoptado aquí.
+2. ✅ **Sin chmod**: la bóveda quedaba con permisos por defecto — ejecutado
+   como `fs.stat`/`fs.chmod` (M115.3), adoptado aquí junto a `fs.sync` y
+   `fs.try_lock` del mismo hito.
 3. **La zeroización es inexpresable**: los secretos viven en strings del GC
    sin borrado garantizado — decisión de diseño del lenguaje que un gestor de
-   secretos hace visible.
+   secretos hace visible (documentada en SECURITY.md de raylang).
 4. **Positivo**: la pila M114 completa (X25519 + HKDF + AEAD) compone el
    sealed box en ~40 líneas sin sorpresas, y el mismo patrón temp+rename de
    rayq/raysync vuelve a dar atomicidad gratis.
+5. **Pendiente: sin KDF de contraseñas** en `std/crypto` (Argon2/PBKDF2). La
+   clave se deriva con HKDF, que no es lento: una passphrase débil se ataca
+   por fuerza bruta a velocidad de HMAC. Es el siguiente hallazgo a llevar
+   a raylang.
 
 ## Desarrollo
 
@@ -75,5 +87,5 @@ ray test
 ray build --native src/main.ray -o raypass --release
 ```
 
-Estructura: `src/main.ray` (CLI) · `vault.ray` (bóveda AEAD) · `sharebox.ray`
-(X25519) · `input.ray` (entrada oculta).
+Estructura: `src/main.ray` (CLI) · `vault.ray` (bóveda AEAD, permisos, lock) ·
+`sharebox.ray` (X25519) · `input.ray` (entrada oculta).

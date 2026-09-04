@@ -88,9 +88,50 @@ fn passphrase() -> Result<string, string> {
 }
 
 fn open_vault(path: string) -> Result<(string, vault.Vault), string> {
+    match (vault.permission_warning(path)) {
+        Option.Some(w) => eprint("raypass: warning: " + w),
+        Option.None => { },
+    }
     let pw = passphrase()?;
     let v = vault.load(path, pw)?;
     return Result.Ok((pw, v));
+}
+
+// Runs CMD with every entry as an env var, relaying its output as it comes.
+fn exec_with(v: vault.Vault, argv: [string]) -> int {
+    var rest: [string] = [];
+    var i = 1;
+    while (i < argv.len()) {
+        rest.push(argv[i]);
+        i = i + 1;
+    }
+    var c = process.cmd(argv[0], rest);
+    for e in v.entries {
+        c = c.env(e.name, e.value);
+    }
+    let p = match (c.merge_output().stream()) {
+        Result.Ok(p) => p,
+        Result.Err(e) => {
+            eprint("raypass: could not launch: " + e);
+            return 1;
+        },
+    };
+    var going = true;
+    while (going) {
+        match (recv(p.out)) {
+            Option.Some(chunk) => {
+                io.write_bytes(chunk);
+                io.flush();
+            },
+            Option.None => {
+                going = false;
+            },
+        }
+    }
+    match (p.wait()) {
+        process.Exit.Code(code) => code,
+        process.Exit.Signal(sig) => 1,
+    }
 }
 
 fn main() -> int {
@@ -128,16 +169,9 @@ fn main() -> int {
             eprint("raypass: passphrase too short (6+ chars)");
             return 1;
         }
-        match (vault.save(
-    path,
-    pw,
-    vault.empty()
-)) {
+        match (vault.save(path, pw, vault.empty())) {
             Result.Ok(n) => {
                 print("vault created: " + path);
-                eprint(
-                    "note: the vault file has DEFAULT permissions — fs has no chmod (recorded finding)"
-                );
                 0
             },
             Result.Err(e) => {
@@ -149,9 +183,7 @@ fn main() -> int {
         let (sec, pub_key) = sharebox.keygen();
         print("secret:  " + sec);
         print("public:  " + pub_key);
-        eprint(
-            "guarda el secret (p. ej. `raypass add raypass-key " + sec + "`); comparte el public"
-        );
+        eprint("keep the secret (e.g. `raypass add raypass-key " + sec + "`); share the public");
         0
     } else if (cmd == "receive") {
         let sec = match (flag_value(av, "--key")) {
@@ -189,7 +221,23 @@ fn main() -> int {
             },
         }
     } else {
-        // Everything below needs the vault open.
+        // Everything below needs the vault open — and locked, so that two
+        // raypass processes cannot lose each other's write.
+        let lock = match (vault.lock(path)) {
+            Result.Ok(h) => h,
+            Result.Err(e) => {
+                eprint("raypass: " + e);
+                return 1;
+            },
+        };
+        let code = vault_command(cmd, av, pos, path);
+        vault.unlock(lock);
+        code
+    }
+}
+
+fn vault_command(cmd: string, av: [string], pos: [string], path: string) -> int {
+    {
         let (pw, v) = match (open_vault(path)) {
             Result.Ok(pair) => pair,
             Result.Err(e) => {
@@ -320,30 +368,7 @@ fn main() -> int {
                 eprint("raypass: exec needs a command after --");
                 return 1;
             }
-            var rest: [string] = [];
-            var i = 1;
-            while (i < argv.len()) {
-                rest.push(argv[i]);
-                i = i + 1;
-            }
-            var c = process.cmd(argv[0], rest);
-            for e in v.entries {
-                c = c.env(e.name, e.value);
-            }
-            match (c.merge_output().run()) {
-                Result.Err(e) => {
-                    eprint("raypass: could not launch: " + e);
-                    1
-                },
-                Result.Ok(out) => {
-                    io.write_bytes(out.stdout);
-                    io.flush();
-                    match (out.exit) {
-                        process.Exit.Code(code) => code,
-                        process.Exit.Signal(sig) => 1,
-                    }
-                },
-            }
+            exec_with(v, argv)
         } else {
             eprint("raypass: unknown command: " + cmd);
             usage();
