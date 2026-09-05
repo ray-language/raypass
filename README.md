@@ -9,6 +9,7 @@ vault created: ~/.raypass.vault
 
 $ raypass add db_url                      # pide el valor oculto
 $ raypass gen deploy_token --len 32       # genera, guarda e imprime
+$ raypass gen                             # solo genera (no abre la bóveda)
 $ raypass list
 db_url
 deploy_token
@@ -24,6 +25,27 @@ postgres://…
 ```
 
 `RAYPASS_PASSPHRASE` sirve para scripts/CI (y para los tests).
+
+## Comandos
+
+`raypass [--vault FILE] COMANDO`. La bóveda es `$HOME/.raypass.vault` salvo
+`--vault`; los comandos marcados 🔐 piden la passphrase (oculta, o por env).
+
+| Comando | Qué hace |
+|---------|----------|
+| `init` 🔐 | crea una bóveda vacía (pide la passphrase nueva, 6+ caracteres) |
+| `add NAME [VALUE]` 🔐 | guarda un secreto; sin VALUE lo pide oculto. Reemplaza si ya existe |
+| `get NAME` 🔐 | imprime el secreto |
+| `list` 🔐 | lista los nombres |
+| `rm NAME` 🔐 | borra una entrada |
+| `gen [NAME] [--len N]` | genera una contraseña (24 caracteres por defecto) y la imprime; con NAME además la guarda 🔐 (reemplaza si ya existe) |
+| `exec -- CMD [ARGS...]` 🔐 | ejecuta CMD con cada entrada como variable de entorno; la salida se retransmite y el código de salida es el del hijo |
+| `keygen` | par X25519 para compartir: imprime secret y public |
+| `share NAME --to PUBKEY` 🔐 | sella un secreto para la public de alguien (sealed box) |
+| `receive --key SECKEY` | descifra un blob compartido leído de stdin |
+
+Códigos de salida: 0 ok, 1 error (passphrase errónea, entrada inexistente,
+bóveda en uso por otro proceso…); en `exec`, el del hijo.
 
 ## Diseño
 

@@ -14,7 +14,7 @@ fn usage() {
     eprint("  get NAME                 print a secret");
     eprint("  list                     list entry names");
     eprint("  rm NAME                  delete an entry");
-    eprint("  gen NAME [--len N]       generate, store and print a password (default 24)");
+    eprint("  gen [NAME] [--len N]     generate a password (default 24); with NAME also store it");
     eprint("  exec -- CMD [ARGS...]    run CMD with every entry injected as env var");
     eprint("  keygen                   X25519 pair for sharing (prints secret + public)");
     eprint("  share NAME --to PUBKEY   seal a secret to someone's public key");
@@ -81,6 +81,18 @@ fn after_dashdash(av: [string]) -> [string] {
         }
     }
     out
+}
+
+fn password_length(av: [string]) -> int {
+    match (flag_value(av, "--len")) {
+        Option.Some(s) => {
+            match (parse_int(s)) {
+                Option.Some(n) => if (n > 0) { n } else { 24 },
+                Option.None => 24,
+            }
+        },
+        Option.None => 24,
+    }
 }
 
 fn passphrase() -> Result<string, string> {
@@ -184,6 +196,10 @@ fn main() -> int {
         print("secret:  " + sec);
         print("public:  " + pub_key);
         eprint("keep the secret (e.g. `raypass add raypass-key " + sec + "`); share the public");
+        0
+    } else if (cmd == "gen" && pos.len() == 0) {
+        // No name: generate and print only, the vault stays closed.
+        print(vault.generate(password_length(av)));
         0
     } else if (cmd == "receive") {
         let sec = match (flag_value(av, "--key")) {
@@ -304,23 +320,7 @@ fn vault_command(cmd: string, av: [string], pos: [string], path: string) -> int 
                 },
             }
         } else if (cmd == "gen") {
-            if (pos.len() < 1) {
-                usage();
-                return 1;
-            }
-            var len = 24;
-            match (flag_value(av, "--len")) {
-                Option.Some(s) => {
-                    match (parse_int(s)) {
-                        Option.Some(n) => {
-                            len = n;
-                        },
-                        Option.None => { },
-                    }
-                },
-                Option.None => { },
-            }
-            let value = vault.generate(len);
+            let value = vault.generate(password_length(av));
             vault.upsert(v, pos[0], value);
             match (vault.save(path, pw, v)) {
                 Result.Ok(n) => {
