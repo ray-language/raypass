@@ -3,21 +3,31 @@ import std/fs;
 import vault;
 import sharebox;
 
-const PATH: string = "/tmp/raypass_test.vault";
+// A fresh vault path inside its own temp dir (remove the dir with fs.remove_all).
+fn temp_vault() -> (string, string) {
+    match (fs.make_temp_dir("raypass_test_")) {
+        Result.Ok(dir) => (dir, dir + "/test.vault"),
+        Result.Err(e) => panic(e),
+    }
+}
+
+// A format-1 vault (HKDF key derivation) written by raypass before format 2,
+// passphrase "legacy-pass", one entry db-password = "s3cr3t!".
+const LEGACY_VAULT: string = "{\"box\":\"kA/q1qNZ7EKotrbQh06R4134uOcle52yehZWf6h/E7zziApAoRapKpc4YDbuv3naNFxsFkwYqcAXWc6SpGGz16gUuW+cl7YtKLTx+NzU\",\"nonce\":\"8b18f0d531c9a971817390cd\",\"salt\":\"cdd50f52b84dbf007a3f7e866a623300\"}";
 
 @test
 fn vault_round_trip_and_wrong_passphrase() {
-    fs.remove_file(PATH);
+    let (dir, path) = temp_vault();
     var v = vault.empty();
     vault.upsert(v, "db-password", "s3cr3t!");
     vault.upsert(v, "api-key", "ak-123");
     vault.upsert(v, "db-password", "nuevo");
-    match (vault.save(PATH, "correcta", v)) {
+    match (vault.save(path, "correcta", v)) {
         Result.Ok(n) => { },
         Result.Err(e) => panic(e),
     }
-    assert(!fs.exists(PATH + ".tmp"));
-    let loaded = match (vault.load(PATH, "correcta")) {
+    assert(!fs.exists(path + ".tmp"));
+    let loaded = match (vault.load(path, "correcta")) {
         Result.Ok(x) => x,
         Result.Err(e) => panic(e),
     };
@@ -26,12 +36,12 @@ fn vault_round_trip_and_wrong_passphrase() {
         Option.Some(val) => assert_eq(val, "nuevo"),
         Option.None => panic("missing db-password"),
     }
-    match (vault.load(PATH, "incorrecta")) {
+    match (vault.load(path, "incorrecta")) {
         Result.Err(e) => assert(e.contains("passphrase")),
         Result.Ok(x) => panic("wrong passphrase must fail"),
     }
     // The ciphertext never contains the secret in clear.
-    match (fs.read_file(PATH)) {
+    match (fs.read_file(path)) {
         Result.Ok(raw) => {
             assert(!raw.contains("s3cr3t"));
             assert(!raw.contains("nuevo"));
@@ -39,11 +49,11 @@ fn vault_round_trip_and_wrong_passphrase() {
         },
         Result.Err(e) => panic(e),
     }
+    fs.remove_all(dir);
 }
 
 @test
 fn remove_and_generate() {
-    fs.remove_file(PATH);
     var v = vault.empty();
     vault.upsert(v, "a", "1");
     assert(vault.remove_entry(v, "a"));
@@ -95,47 +105,103 @@ fn generated_passwords_stay_in_the_alphabet() {
 
 @test
 fn saved_vault_is_owner_only_and_warns_when_loosened() {
-    fs.remove_file(PATH);
-    match (vault.save(PATH, "pw", vault.empty())) {
+    let (dir, path) = temp_vault();
+    match (vault.save(path, "pw", vault.empty())) {
         Result.Ok(n) => { },
         Result.Err(e) => panic(e),
     }
-    match (fs.stat(PATH)) {
+    match (fs.stat(path)) {
         Result.Ok(st) => assert_eq(st.mode, 0o600),
         Result.Err(e) => panic(e),
     }
-    match (vault.permission_warning(PATH)) {
+    match (vault.permission_warning(path)) {
         Option.None => { },
         Option.Some(w) => panic("unexpected warning: " + w),
     }
-    match (fs.chmod(PATH, 0o644)) {
+    match (fs.chmod(path, 0o644)) {
         Result.Ok(n) => { },
         Result.Err(e) => panic(e),
     }
-    match (vault.permission_warning(PATH)) {
+    match (vault.permission_warning(path)) {
         Option.Some(w) => assert(w.contains("readable by others")),
         Option.None => panic("a 0644 vault must warn"),
     }
     // A missing vault does not warn (init creates it).
-    match (vault.permission_warning(PATH + ".missing")) {
+    match (vault.permission_warning(path + ".missing")) {
         Option.None => { },
         Option.Some(w) => panic("missing vault must not warn"),
     }
+    fs.remove_all(dir);
 }
 
 @test
 fn lock_is_exclusive_until_released() {
-    let first = match (vault.lock(PATH)) {
+    let (dir, path) = temp_vault();
+    let first = match (vault.lock(path)) {
         Result.Ok(h) => h,
         Result.Err(e) => panic(e),
     };
-    match (vault.lock(PATH)) {
+    match (vault.lock(path)) {
         Result.Err(e) => assert(e.contains("in use")),
         Result.Ok(h) => panic("second lock must fail while the first is held"),
     }
     vault.unlock(first);
-    match (vault.lock(PATH)) {
+    match (vault.lock(path)) {
         Result.Ok(h) => vault.unlock(h),
         Result.Err(e) => panic("lock must be free after unlock: " + e),
     }
+    fs.remove_all(dir);
+}
+
+@test
+fn legacy_format_1_vault_opens_and_upgrades_on_save() {
+    let (dir, path) = temp_vault();
+    match (fs.write_file(path, LEGACY_VAULT)) {
+        Result.Ok(n) => { },
+        Result.Err(e) => panic(e),
+    }
+    let v = match (vault.load(path, "legacy-pass")) {
+        Result.Ok(x) => x,
+        Result.Err(e) => panic(e),
+    };
+    assert_eq(v.format, 1);
+    match (vault.find(v, "db-password")) {
+        Option.Some(val) => assert_eq(val, "s3cr3t!"),
+        Option.None => panic("missing db-password"),
+    }
+    match (vault.load(path, "wrong")) {
+        Result.Err(e) => assert(e.contains("passphrase")),
+        Result.Ok(x) => panic("wrong passphrase must fail on a legacy vault too"),
+    }
+    // Saving rewrites it as format 2 (PBKDF2), readable with the same passphrase.
+    match (vault.save(path, "legacy-pass", v)) {
+        Result.Ok(n) => { },
+        Result.Err(e) => panic(e),
+    }
+    let raw = match (fs.read_file(path)) {
+        Result.Ok(s) => s,
+        Result.Err(e) => panic(e),
+    };
+    assert(raw.contains("\"kdf\":\"pbkdf2-sha256\""));
+    assert(raw.contains("\"iter\":600000"));
+    assert(raw.contains("\"v\":2"));
+    let upgraded = match (vault.load(path, "legacy-pass")) {
+        Result.Ok(x) => x,
+        Result.Err(e) => panic(e),
+    };
+    assert_eq(upgraded.format, vault.FORMAT);
+    match (vault.find(upgraded, "db-password")) {
+        Option.Some(val) => assert_eq(val, "s3cr3t!"),
+        Option.None => panic("entry lost in the upgrade"),
+    }
+    // A vault from a newer raypass is refused, not misread.
+    match (fs.write_file(path, raw.replace("\"v\":2", "\"v\":3"))) {
+        Result.Ok(n) => { },
+        Result.Err(e) => panic(e),
+    }
+    match (vault.load(path, "legacy-pass")) {
+        Result.Err(e) => assert(e.contains("unsupported vault format")),
+        Result.Ok(x) => panic("format 3 must be refused"),
+    }
+    fs.remove_all(dir);
 }

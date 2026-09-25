@@ -1,6 +1,6 @@
 # raypass
 
-Gestor de secretos para la línea de comandos, escrito en [raylang](https://github.com/ray-language/raylang): una bóveda de un solo archivo cifrada entera con ChaCha20-Poly1305 (clave por passphrase vía HKDF, escritura atómica por rename), entrada de passphrase **oculta** (raw mode sin eco), generador de contraseñas CSPRNG, `exec` que inyecta los secretos como variables de entorno del hijo, y **compartir un secreto con una persona** vía sealed box X25519.
+Gestor de secretos para la línea de comandos, escrito en [raylang](https://github.com/ray-language/raylang): una bóveda de un solo archivo cifrada entera con ChaCha20-Poly1305 (clave por passphrase vía PBKDF2-HMAC-SHA256 de 600 000 rondas, escritura atómica por rename), entrada de passphrase **oculta** (raw mode sin eco), generador de contraseñas CSPRNG, `exec` que inyecta los secretos como variables de entorno del hijo, y **compartir un secreto con una persona** vía sealed box X25519.
 
 ```text
 $ raypass init
@@ -49,10 +49,15 @@ bóveda en uso por otro proceso…); en `exec`, el del hijo.
 
 ## Diseño
 
-- **Bóveda**: `{"salt", "nonce", "box"}`; box = AEAD(HKDF(salt, passphrase,
-  "raypass-v1"), nonce fresco por guardado, aad="raypass", JSON de entradas).
+- **Bóveda** (formato 2): `{"v": 2, "kdf": "pbkdf2-sha256", "iter", "salt",
+  "nonce", "box"}`; box = AEAD(PBKDF2-HMAC-SHA256(passphrase, salt, 600 000
+  rondas), nonce fresco por guardado, aad="raypass-v2", JSON de entradas).
   Passphrase errónea = fallo de autenticación AEAD, sin más oráculo. Guardado
   por temp + `fs.rename` (una escritura rota jamás corrompe la bóveda).
+- **Migración del formato 1**: las bóvedas antiguas (`{"salt", "nonce",
+  "box"}`, clave por HKDF) se siguen leyendo; al abrir una, raypass la
+  reescribe en formato 2 en el acto (bajo el lock) y lo avisa por stderr.
+  Una bóveda de un formato más nuevo se rechaza en vez de malinterpretarse.
 - **Compartir**: par efímero X25519; clave = HKDF(eph_pub, DH, "raypass-share");
   blob = eph_pub ‖ nonce ‖ box (la regla M114: el DH crudo SIEMPRE pasa por
   HKDF antes de ser clave AEAD). Manipular el blob rompe la autenticación.
@@ -75,13 +80,14 @@ bóveda en uso por otro proceso…); en `exec`, el del hijo.
 | keygen/share/receive (sealed box X25519, tamper-proof) | ✅ |
 | Escritura atómica de la bóveda; el cifrado nunca filtra valores (test) | ✅ |
 | Binario nativo | ✅ |
-| Tests (bóveda, passphrase errónea, share, alfabeto, permisos, lock) | ✅ 6 |
+| Tests (bóveda, passphrase errónea, share, alfabeto, permisos, lock, migración v1→v2) | ✅ 7 |
+| KDF lenta para la passphrase (PBKDF2, 600 000 rondas) + migración | ✅ |
 | chmod 600 de la bóveda + aviso si está más abierta | ✅ (M115.3) |
 | fsync antes del rename; lock entre procesos | ✅ (M115.1/.2) |
 | Zeroización de secretos en memoria | ❌ inexpresable (strings GC) |
 | Portapapeles con auto-borrado, TOTP | 📋 v2 |
 
-## Hallazgos de dogfod
+## Hallazgos de dogfood
 
 Anotados en `raylang/IDEAS.md` §71:
 
@@ -97,12 +103,14 @@ Anotados en `raylang/IDEAS.md` §71:
 4. **Positivo**: la pila M114 completa (X25519 + HKDF + AEAD) compone el
    sealed box en ~40 líneas sin sorpresas, y el mismo patrón temp+rename de
    rayq/raysync vuelve a dar atomicidad gratis.
-5. **Pendiente: sin KDF de contraseñas** en `std/crypto` (Argon2/PBKDF2). La
-   clave se deriva con HKDF, que no es lento: una passphrase débil se ataca
-   por fuerza bruta a velocidad de HMAC. Es el siguiente hallazgo a llevar
-   a raylang.
+5. ✅ **Sin KDF de contraseñas** en `std/crypto`: la clave se derivaba con
+   HKDF, que no es lento (una passphrase débil se atacaba por fuerza bruta a
+   velocidad de HMAC). Ejecutado como `crypto.pbkdf2_hmac_sha256` (M290),
+   adoptado aquí con el formato 2 de la bóveda y migración automática.
 
 ## Desarrollo
+
+Requiere raylang 1.27+ (sin dependencias externas).
 
 ```sh
 ray test

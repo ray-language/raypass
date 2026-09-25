@@ -1,10 +1,16 @@
 // raypass — the vault: one encrypted file, whole-file AEAD.
 //
-// On disk: {"salt": hex, "nonce": hex, "box": base64} where box =
-// ChaCha20-Poly1305(key = HKDF(salt, passphrase, "raypass-v1"), nonce,
-// aad = "raypass", plaintext = JSON {name: {value, updated_ms}}). Every save
-// draws a fresh nonce and goes through temp + rename (atomic). A wrong
-// passphrase fails AEAD authentication — there is no oracle beyond open().
+// On disk (format 2): {"v": 2, "kdf": "pbkdf2-sha256", "iter": N, "salt": hex,
+// "nonce": hex, "box": base64} where box = ChaCha20-Poly1305(key =
+// PBKDF2-HMAC-SHA256(passphrase, salt, N rounds), nonce, aad = "raypass-v2",
+// plaintext = JSON {name: {value, updated_ms}}). Every save draws a fresh salt
+// and nonce and goes through temp + rename (atomic). A wrong passphrase fails
+// AEAD authentication — there is no oracle beyond open().
+//
+// Format 1 (no "v" field) derived the key with HKDF, which is fast by design
+// and therefore cheap to brute-force offline. It is still READ (key =
+// HKDF(salt, passphrase, "raypass-v1"), aad = "raypass"); `Vault.format`
+// reports it and the next save rewrites the file as format 2.
 //
 // Durability and concurrency (raylang M115): the temp file is fsync'ed
 // before the rename (survives a power cut, not only a crash), the vault is
@@ -31,9 +37,28 @@ pub struct Entry {
 
 pub struct Vault {
     entries: [Entry],
+    // On-disk format it was loaded from (FORMAT for a new vault).
+    format: int,
 }
 
-fn derive_key(passphrase: string, salt: bytes) -> bytes {
+// The current on-disk format and its key derivation cost (OWASP's PBKDF2-SHA256
+// figure, the same as crypto.PASSWORD_ITERATIONS).
+pub const FORMAT: int = 2;
+
+pub const KDF_ITERATIONS: int = 600000;
+
+// Upper bound accepted from a vault file, so a tampered "iter" cannot hang open().
+const MAX_KDF_ITERATIONS: int = 50000000;
+
+fn derive_key(passphrase: string, salt: bytes, iterations: int) -> Result<bytes, string> {
+    match (crypto.pbkdf2_hmac_sha256(passphrase.to_bytes(), salt, iterations, 32)) {
+        Option.Some(k) => Result.Ok(k),
+        Option.None => Result.Err("bad key derivation parameters"),
+    }
+}
+
+// Format 1 key derivation (HKDF over the passphrase) — read-only legacy path.
+fn derive_key_v1(passphrase: string, salt: bytes) -> bytes {
     match (crypto.hkdf_sha256(salt, passphrase.to_bytes(), "raypass-v1".to_bytes(), 32)) {
         Option.Some(k) => k,
         Option.None => b"",
@@ -77,17 +102,17 @@ fn entries_from_json(s: string) -> Result<Vault, string> {
             return Result.Err("vault payload is not an object");
         },
     }
-    Result.Ok(Vault { entries: out })
+    Result.Ok(Vault { entries: out, format: FORMAT })
 }
 
 pub fn save(path: string, passphrase: string, v: Vault) -> Result<int, string> {
     let salt = crypto.random_bytes(16);
     let nonce = crypto.random_bytes(12);
-    let key = derive_key(passphrase, salt);
+    let key = derive_key(passphrase, salt, KDF_ITERATIONS)?;
     let sealed = match (crypto.chacha20poly1305_seal(
         key,
         nonce,
-        "raypass".to_bytes(),
+        "raypass-v2".to_bytes(),
         entries_to_json(v).to_bytes()
     )) {
         Option.Some(b) => b,
@@ -96,6 +121,9 @@ pub fn save(path: string, passphrase: string, v: Vault) -> Result<int, string> {
         },
     };
     var m: Map<string, Json> = Map.new();
+    m.insert("v", Json.JNum(FORMAT as float));
+    m.insert("kdf", Json.JStr("pbkdf2-sha256"));
+    m.insert("iter", Json.JNum(KDF_ITERATIONS as float));
     m.insert("salt", Json.JStr(hex.hex_encode(salt)));
     m.insert("nonce", Json.JStr(hex.hex_encode(nonce)));
     m.insert("box", Json.JStr(base64.base64(sealed)));
@@ -198,11 +226,46 @@ pub fn load(path: string, passphrase: string) -> Result<Vault, string> {
             return Result.Err("missing box");
         },
     };
-    let key = derive_key(passphrase, salt);
-    match (crypto.chacha20poly1305_open(key, nonce, "raypass".to_bytes(), boxed)) {
+    let format = match (json.get_int(j, "v")) {
+        Option.Some(n) => n,
+        Option.None => 1,
+    };
+    var key = b"";
+    var aad = "";
+    if (format == 1) {
+        key = derive_key_v1(passphrase, salt);
+        aad = "raypass";
+    } else if (format == 2) {
+        match (json.get_string(j, "kdf")) {
+            Option.Some(k) => {
+                if (k != "pbkdf2-sha256") {
+                    return Result.Err("unsupported key derivation: " + k);
+                }
+            },
+            Option.None => {
+                return Result.Err("missing kdf");
+            },
+        }
+        let iterations = match (json.get_int(j, "iter")) {
+            Option.Some(n) => n,
+            Option.None => {
+                return Result.Err("missing iter");
+            },
+        };
+        if (iterations < 1 || iterations > MAX_KDF_ITERATIONS) {
+            return Result.Err("bad iter");
+        }
+        key = derive_key(passphrase, salt, iterations)?;
+        aad = "raypass-v2";
+    } else {
+        return Result.Err("unsupported vault format " + to_string(format) + " (newer raypass?)");
+    }
+    match (crypto.chacha20poly1305_open(key, nonce, aad.to_bytes(), boxed)) {
         Option.Some(plain) => {
             let s = from_utf8(plain)?;
-            entries_from_json(s)
+            var v = entries_from_json(s)?;
+            v.format = format;
+            Result.Ok(v)
         },
         Option.None => Result.Err("wrong passphrase (or corrupted vault)"),
     }
@@ -210,7 +273,7 @@ pub fn load(path: string, passphrase: string) -> Result<Vault, string> {
 
 pub fn empty() -> Vault {
     var entries: [Entry] = [];
-    Vault { entries: entries }
+    Vault { entries: entries, format: FORMAT }
 }
 
 pub fn find(v: Vault, name: string) -> Option<string> {

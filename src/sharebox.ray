@@ -10,12 +10,9 @@ import std/base64;
 pub fn keygen() -> (string, string) {
     let sec = crypto.random_bytes(32);
     match (crypto.x25519_public_key(sec)) {
-        Option.Some(pub_key) => {
-            return (base64.base64url(sec), base64.base64url(pub_key));
-        },
-        Option.None => { },
+        Option.Some(pub_key) => (base64.base64url(sec), base64.base64url(pub_key)),
+        Option.None => ("", ""),
     }
-    return ("", "");
 }
 
 fn derive(eph_pub: bytes, shared: bytes) -> bytes {
