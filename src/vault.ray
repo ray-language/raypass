@@ -126,13 +126,15 @@ fn octal(mode: int) -> string {
 // A warning when the vault is readable by group/others (like ssh does with
 // private keys); None when the mode is 0o600 or stricter.
 pub fn permission_warning(path: string) -> Option<string> {
-    match (fs.stat(
-    path
-)) {
+    match (fs.stat(path)) {
         Result.Ok(st) => {
             if ((st.mode & 0o77) != 0) {
                 Option.Some(
-                    "vault " + path + " is readable by others (mode " + octal(st.mode) + "); fixing it to 0600 on next save"
+                    "vault "
+                        + path
+                        + " is readable by others (mode "
+                        + octal(st.mode)
+                        + "); fixing it to 0600 on next save"
                 )
             } else {
                 Option.None
