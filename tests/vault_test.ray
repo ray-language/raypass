@@ -1,5 +1,6 @@
 // Vault round trips, wrong passphrase, generation, and the sealed-box share.
 import std/fs;
+import std/json;
 import vault;
 import sharebox;
 
@@ -182,9 +183,13 @@ fn legacy_format_1_vault_opens_and_upgrades_on_save() {
         Result.Ok(s) => s,
         Result.Err(e) => panic(e),
     };
-    assert(raw.contains("\"kdf\":\"pbkdf2-sha256\""));
-    assert(raw.contains("\"iter\":600000"));
-    assert(raw.contains("\"v\":2"));
+    let header = match (json.parse(raw)) {
+        Result.Ok(j) => j,
+        Result.Err(e) => panic(e),
+    };
+    assert_eq(json.get_string(header, "kdf"), Option.Some("pbkdf2-sha256"));
+    assert_eq(json.get_int(header, "iter"), Option.Some(600000));
+    assert_eq(json.get_int(header, "v"), Option.Some(2));
     let upgraded = match (vault.load(path, "legacy-pass")) {
         Result.Ok(x) => x,
         Result.Err(e) => panic(e),
@@ -195,7 +200,9 @@ fn legacy_format_1_vault_opens_and_upgrades_on_save() {
         Option.None => panic("entry lost in the upgrade"),
     }
     // A vault from a newer raypass is refused, not misread.
-    match (fs.write_file(path, raw.replace("\"v\":2", "\"v\":3"))) {
+    let newer = raw.replace("\"v\": 2", "\"v\": 3");
+    assert(newer != raw);
+    match (fs.write_file(path, newer)) {
         Result.Ok(n) => { },
         Result.Err(e) => panic(e),
     }
