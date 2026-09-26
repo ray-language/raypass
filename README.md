@@ -110,7 +110,7 @@ Anotados en `raylang/IDEAS.md` §71:
 
 ## Desarrollo
 
-Requiere raylang 1.27+ (sin dependencias externas).
+Requiere raylang 1.27.13+ (sin dependencias externas).
 
 ```sh
 ray test

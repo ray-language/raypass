@@ -65,15 +65,13 @@ fn derive_key_v1(passphrase: string, salt: bytes) -> bytes {
     }
 }
 
+// Entry names are unique (upsert replaces), so appending fields is safe.
 fn entries_to_json(v: Vault) -> string {
-    var m: Map<string, Json> = Map.new();
+    var o = json.obj();
     for e in v.entries {
-        var em: Map<string, Json> = Map.new();
-        em.insert("value", Json.JStr(e.value));
-        em.insert("updated_ms", Json.JNum(e.updated_ms as float));
-        m.insert(e.name, Json.JObject(em));
+        o = o.field(e.name, json.obj().field("value", e.value).field("updated_ms", e.updated_ms));
     }
-    json.stringify(Json.JObject(m))
+    o.render()
 }
 
 fn entries_from_json(s: string) -> Result<Vault, string> {
@@ -120,16 +118,18 @@ pub fn save(path: string, passphrase: string, v: Vault) -> Result<int, string> {
             return Result.Err("seal failed");
         },
     };
-    var m: Map<string, Json> = Map.new();
-    m.insert("v", Json.JNum(FORMAT as float));
-    m.insert("kdf", Json.JStr("pbkdf2-sha256"));
-    m.insert("iter", Json.JNum(KDF_ITERATIONS as float));
-    m.insert("salt", Json.JStr(hex.hex_encode(salt)));
-    m.insert("nonce", Json.JStr(hex.hex_encode(nonce)));
-    m.insert("box", Json.JStr(base64.base64(sealed)));
+    let doc = json
+        .obj()
+        .field("v", FORMAT)
+        .field("kdf", "pbkdf2-sha256")
+        .field("iter", KDF_ITERATIONS)
+        .field("salt", hex.hex_encode(salt))
+        .field("nonce", hex.hex_encode(nonce))
+        .field("box", base64.base64(sealed))
+        .render();
     let tmp = path + ".tmp";
     let h = fs.open(tmp, "w")?;
-    let written = fs.write(h, json.stringify(Json.JObject(m)));
+    let written = fs.write(h, doc);
     // fsync BEFORE the rename: otherwise a power cut can leave an empty vault.
     let synced = fs.sync(h);
     close(h);

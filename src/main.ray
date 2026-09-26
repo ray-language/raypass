@@ -142,9 +142,7 @@ fn exec_with(v: vault.Vault, argv: [string]) -> int {
                 io.write_bytes(chunk);
                 io.flush();
             },
-            Option.None => {
-                break;
-            },
+            Option.None => break,
         }
     }
     match (p.wait()) {
@@ -225,9 +223,7 @@ fn main() -> int {
                         Result.Err(e) => { },
                     }
                 },
-                Option.None => {
-                    break;
-                },
+                Option.None => break,
             }
         }
         match (sharebox.open_from(sec, blob.trim())) {
