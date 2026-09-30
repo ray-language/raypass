@@ -41,11 +41,12 @@ pub struct Vault {
     format: int,
 }
 
-// The current on-disk format and its key derivation cost (OWASP's PBKDF2-SHA256
-// figure, the same as crypto.PASSWORD_ITERATIONS).
+/// The current on-disk format (what a new vault is saved as).
 pub const FORMAT: int = 2;
 
-pub const KDF_ITERATIONS: int = 600000;
+/// PBKDF2-HMAC-SHA256 rounds for a new save: the stdlib's work factor (OWASP).
+/// Older vaults keep the count stored in their "iter" field.
+pub const KDF_ITERATIONS: int = crypto.PASSWORD_ITERATIONS;
 
 // Upper bound accepted from a vault file, so a tampered "iter" cannot hang open().
 const MAX_KDF_ITERATIONS: int = 50000000;
@@ -118,8 +119,7 @@ pub fn save(path: string, passphrase: string, v: Vault) -> Result<int, string> {
             return Result.Err("seal failed");
         },
     };
-    let doc = json
-        .obj()
+    let doc = json.obj()
         .field("v", FORMAT)
         .field("kdf", "pbkdf2-sha256")
         .field("iter", KDF_ITERATIONS)
@@ -310,6 +310,7 @@ pub fn remove_entry(v: Vault, name: string) -> bool {
     found
 }
 
+/// The characters `generate` draws from.
 pub const ALPHABET: string = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:+*";
 
 // A generated password: letters, digits and safe punctuation, CSPRNG-backed.
