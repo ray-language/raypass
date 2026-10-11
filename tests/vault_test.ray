@@ -200,7 +200,7 @@ fn legacy_format_1_vault_opens_and_upgrades_on_save() {
         Option.None => panic("entry lost in the upgrade"),
     }
     // A vault from a newer raypass is refused, not misread.
-    let newer = raw.replace("\"v\": 2", "\"v\": 3");
+    let newer = raw.replace("\"v\":2", "\"v\":3");
     assert(newer != raw);
     match (fs.write_file(path, newer)) {
         Result.Ok(n) => { },
